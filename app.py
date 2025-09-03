@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-# Streamlit (sin uploader): lee 'ratios_aeronaves_mensual_2014_2025.xlsx'
-# Filtros: Aerolíneas (multi), Años (multi), Mes inicio/fin (mismo año; se aplica a todos)
-# Muestra curvas diarias si existe 'Ratios_diarios' y resalta TOP 1/2/3 del año (asignado por día inicial).
+# Streamlit: lee internamente 'ratios_aeronaves_mensual_2014_2025.xlsx' (sin uploader)
+# Filtros: Aerolíneas (multi), Rango de fechas libre (Año+Mes inicio/fin, puede cruzar años),
+#          TOP (1 o 3) y Modo de gráfico (Acumulada / Una por año).
+# Gráficas: ratio diario + MA7 y sombreado de TOP 90 días (por año, asignado al año del INICIO).
+# Tabla: TOPs filtrados por aerolínea y años dentro del rango.
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,14 +18,13 @@ from pandas.tseries.offsets import MonthEnd
 
 st.set_page_config(page_title="Top 90 días (Excel ratios)", layout="wide")
 
-DEFAULT_RATIOS_XLSX = "ratios_aeronaves_mensual_2014_2025.xlsx"
-
+# ---- Colores y meses ----
 COLORS = {
     "daily":   "#7F8C8D",
     "ma7":     "#111111",
-    "top1":    "#2E7D32",
-    "top2":    "#F39C12",
-    "top3":    "#1F77B4",
+    "top1":    "#2E7D32",   # verde
+    "top2":    "#F39C12",   # naranja
+    "top3":    "#1F77B4",   # azul
     "bgband":  "rgba(0,0,0,0.06)",
 }
 
@@ -33,13 +34,23 @@ MESES = [
     ("Septiembre", 9), ("Octubre",10), ("Noviembre",11), ("Diciembre",12)
 ]
 MES_A_NUM = {n:i for n,i in MESES}
+NUM_A_MES = {i:n for n,i in MESES}
 
-# ---------- carga desde el Excel de ratios ----------
+# ---- Localización del Excel en el repo / entorno ----
+PATH_CANDIDATES = [
+    Path("ratios_aeronaves_mensual_2014_2025.xlsx"),
+    Path("data/ratios_aeronaves_mensual_2014_2025.xlsx"),
+    Path("/mnt/data/ratios_aeronaves_mensual_2014_2025.xlsx"),
+]
+
+# ---------- Carga desde el Excel de ratios ----------
 @st.cache_data(show_spinner=True)
-def load_from_ratios_excel(path_str: str) -> Dict:
-    p = Path(path_str)
-    if not p.exists():
-        raise FileNotFoundError(f"No encuentro el archivo: {p.resolve()}")
+def load_from_ratios_excel() -> Dict:
+    p = next((pp for pp in PATH_CANDIDATES if pp.exists()), None)
+    if p is None:
+        raise FileNotFoundError(
+            "No encuentro 'ratios_aeronaves_mensual_2014_2025.xlsx' en las rutas esperadas."
+        )
 
     xls = pd.ExcelFile(p)
     sheets = set(xls.sheet_names)
@@ -49,7 +60,7 @@ def load_from_ratios_excel(path_str: str) -> Dict:
 
     top90 = pd.read_excel(xls, sheet_name="Top90d_por_año")
 
-    # normaliza nombres
+    # normaliza nombres (tilde/ño)
     ren = {}
     if "Aerolinea" in top90.columns: ren["Aerolinea"] = "Aerolínea"
     if "Ano" in top90.columns: ren["Ano"] = "Año"
@@ -72,6 +83,7 @@ def load_from_ratios_excel(path_str: str) -> Dict:
 
     airlines = sorted(top90["Aerolínea"].astype(str).unique().tolist())
 
+    # Serie diaria (opcional): si existe, mejor para graficar
     ratio_day = ratio_ma7 = None
     if "Ratios_diarios" in sheets:
         rd = pd.read_excel(xls, sheet_name="Ratios_diarios")
@@ -82,23 +94,35 @@ def load_from_ratios_excel(path_str: str) -> Dict:
                 date_col = cand; break
         if date_col is None:
             date_col = rd.columns[0]
-
         rd[date_col] = pd.to_datetime(rd[date_col], errors="coerce")
         rd = rd[rd[date_col].notna()].copy().sort_values(date_col).set_index(date_col)
 
-        # usar sólo aerolíneas presentes en los diarios
         cols = [c for c in rd.columns if c in set(airlines)]
         if cols:
             ratio_day = rd[cols].astype(float)
             ratio_ma7 = ratio_day.rolling(window=7, min_periods=1).mean()
-            airlines = cols
+            airlines = cols  # limitar a las que tienen diarios
 
     return {"top90": top90, "ratio_day": ratio_day, "ratio_ma7": ratio_ma7, "airlines": airlines}
 
+def year_ticks_lines(fig: go.Figure, start: pd.Timestamp, end: pd.Timestamp):
+    """Añade líneas verticales en cada 1 de enero dentro del rango."""
+    y = start.year + 1
+    while y <= end.year:
+        x = pd.Timestamp(year=y, month=1, day=1)
+        fig.add_vline(x=x, line_width=1, line_dash="dot", line_color="#555555")
+        y += 1
+
 def make_figure(ser_daily: pd.Series, ser_ma7: pd.Series,
-                top_rows: pd.DataFrame, title: str) -> go.Figure:
+                top_rows_all_years: pd.DataFrame, title: str,
+                x0: pd.Timestamp, x1: pd.Timestamp,
+                mode: str) -> go.Figure:
+    """mode: 'acumulada' (usa todos los TOP de los años del rango) / 'por_año' (filtra por año fuera)"""
     fig = go.Figure()
+    # fondo
     fig.add_hrect(y0=0, y1=1, line_width=0, fillcolor=COLORS["bgband"], opacity=0.35)
+
+    # líneas
     fig.add_trace(go.Scatter(x=ser_daily.index, y=ser_daily.values,
                              mode="lines", line=dict(color=COLORS["daily"], width=2),
                              name="Ratio diario"))
@@ -109,28 +133,37 @@ def make_figure(ser_daily: pd.Series, ser_ma7: pd.Series,
     color_map = {1: COLORS["top1"], 2: COLORS["top2"], 3: COLORS["top3"]}
     legend_used = {1: False, 2: False, 3: False}
 
-    for _, row in top_rows.sort_values("TOP").iterrows():
+    # Sombrear los TOP de todos los años dentro del rango (se recortan visualmente al [x0, x1])
+    for _, row in top_rows_all_years.sort_values(["Año", "TOP"]).iterrows():
         s = pd.to_datetime(row["Inicio_90d"])
         e = pd.to_datetime(row["Fin_90d"])
         color = color_map.get(int(row["TOP"]), "#000")
-        fig.add_vrect(x0=s, x1=e, fillcolor=color, opacity=0.18, line_width=0)
 
-        m = (ser_ma7.index >= s) & (ser_ma7.index <= e)
+        s_plot = max(s, x0)
+        e_plot = min(e, x1)
+        if s_plot > e_plot:
+            continue
+
+        fig.add_vrect(x0=s_plot, x1=e_plot, fillcolor=color, opacity=0.18, line_width=0)
+
+        m = (ser_ma7.index >= s_plot) & (ser_ma7.index <= e_plot)
         if m.any():
             fig.add_trace(go.Scatter(
                 x=ser_ma7.index[m], y=ser_ma7[m].values,
                 mode="lines", line=dict(color=color, width=7),
-                name=f"TOP {int(row['TOP'])} (90d)",
+                name=f"TOP {int(row['TOP'])} (90d) — {row['Año']}",
                 showlegend=not legend_used[int(row["TOP"])]
             ))
             legend_used[int(row["TOP"])] = True
 
-        mid = s + (e - s) / 2
-        y_mid = np.nanmedian(ser_ma7[(ser_ma7.index >= s) & (ser_ma7.index <= e)].values) if m.any() else 0.6
+        mid = s_plot + (e_plot - s_plot) / 2
+        y_mid = np.nanmedian(ser_ma7[(ser_ma7.index >= s_plot) & (ser_ma7.index <= e_plot)].values) if m.any() else 0.6
         fig.add_annotation(x=mid, y=y_mid,
                            text=f"TOP {int(row['TOP'])}<br>{row['Ratio_90d']:.0%}",
                            showarrow=False, bgcolor="white",
                            bordercolor=color, borderwidth=1, opacity=0.95)
+
+    year_ticks_lines(fig, x0, x1)
 
     fig.update_layout(
         title=title,
@@ -141,17 +174,14 @@ def make_figure(ser_daily: pd.Series, ser_ma7: pd.Series,
     )
     return fig
 
-# ---------- UI ----------
+# ================================
+# 1) FILTROS
+# ================================
 st.title("📊 Top 90 días por aerolínea (Excel de ratios)")
-st.caption("Selecciona Aerolínea(s), **Años** (multi) y **Mes inicio/fin** (mismo año; se aplica a todos). Se sombrea TOP 1/2/3 (90 días).")
 
-with st.sidebar:
-    st.header(" Archivo de ratios (ruta local)")
-    ruta = st.text_input("Ruta del Excel", value=DEFAULT_RATIOS_XLSX)
-
-# Cargar datos (solo local)
+# Cargar datos (interno, sin mostrar ruta)
 try:
-    data = load_from_ratios_excel(ruta)
+    data = load_from_ratios_excel()
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -161,92 +191,130 @@ ratio_day: pd.DataFrame | None = data["ratio_day"]
 ratio_ma7: pd.DataFrame | None = data["ratio_ma7"]
 airlines: List[str] = data["airlines"]
 
-# -- Filtros superiores --
 st.header("1) Filtros")
-c1, c2, c3 = st.columns([2,2,3])
+c1, c2, c3 = st.columns([2, 3, 2])
+
 with c1:
-    sel_airlines = st.multiselect("Aerolíneas", options=airlines, default=airlines[:min(4,len(airlines))])
+    sel_airlines = st.multiselect("Aerolíneas", options=airlines, default=airlines[:min(4, len(airlines))])
+    top_k = st.radio("TOP de 90 días por año", ["1 (mejor)", "3 (mejores)"], index=0, horizontal=True)
+    top_k = 1 if top_k.startswith("1") else 3
+
+years_all = sorted(top90["Año"].unique().tolist())
+
 with c2:
-    years_all = sorted(top90["Año"].unique().tolist())
-    sel_years = st.multiselect("Años", options=years_all, default=years_all)
+    # Rango de fechas libre (Año+Mes inicio/fin)
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        year_start = st.selectbox("Año inicio", options=years_all, index=0)
+        month_start = st.selectbox("Mes inicio", options=[n for n,_ in MESES], index=0)
+    with cc2:
+        year_end = st.selectbox("Año fin", options=years_all, index=len(years_all)-1)
+        month_end = st.selectbox("Mes fin", options=[n for n,_ in MESES], index=11)
+
 with c3:
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        mes_ini = st.selectbox("Mes inicio", options=[n for n,_ in MESES], index=0)
-    with col_m2:
-        mes_fin = st.selectbox("Mes fin", options=[n for n,_ in MESES], index=11)
+    mode_graph = st.radio("Modo de gráfico", ["Acumulada (rango completo)", "Una por año"], index=0)
 
-if not sel_airlines or not sel_years:
-    st.warning("Selecciona al menos una aerolínea y uno o más años.")
+if not sel_airlines:
+    st.warning("Selecciona al menos una aerolínea.")
     st.stop()
 
-if MES_A_NUM[mes_ini] > MES_A_NUM[mes_fin]:
-    st.warning("El mes de inicio no puede ser posterior al mes fin (rango dentro del MISMO año).")
+# Validar rango
+start_key = (int(year_start), MES_A_NUM[month_start])
+end_key   = (int(year_end),   MES_A_NUM[month_end])
+if start_key > end_key:
+    st.warning("El inicio debe ser anterior (o igual) al fin.")
     st.stop()
 
-# Rango mensual (se aplica a todos los años seleccionados)
-m_start = MES_A_NUM[mes_ini]
-m_end   = MES_A_NUM[mes_fin]
+x0 = pd.Timestamp(year=int(year_start), month=MES_A_NUM[month_start], day=1)
+x1 = pd.Timestamp(year=int(year_end),   month=MES_A_NUM[month_end],   day=1) + MonthEnd(1)
 
-# ----- GRÁFICAS -----
+# ================================
+# 2) GRÁFICAS
+# ================================
+st.header("2) Gráficas")
+
 if ratio_day is None or ratio_ma7 is None:
-    st.warning("No está la hoja 'Ratios_diarios' en el Excel. Sólo se mostrará la tabla inferior.")
+    st.warning("No está la hoja 'Ratios_diarios' en el Excel. Sólo se muestra la tabla de TOPs.")
 else:
-    st.header("2) Gráficas")
-    # Render en grid de 2 columnas
-    cols = st.columns(2)
-    idx = 0
-    for aer in sel_airlines:
-        if aer not in ratio_day.columns:
-            st.info(f"No hay serie diaria para {aer}.")
-            continue
-
-        # Para cada año seleccionado, una figura
-        for y in sorted(sel_years):
-            ini = pd.Timestamp(year=int(y), month=m_start, day=1)
-            fin = pd.Timestamp(year=int(y), month=m_end, day=1) + MonthEnd(1)
-
-            ser = ratio_day[aer].loc[(ratio_day.index >= ini) & (ratio_day.index <= fin)].dropna()
+    if mode_graph.startswith("Acumulada"):
+        # Una figura por aerolínea, usando TODOS los TOP de los años tocados por [x0,x1]
+        for aer in sel_airlines:
+            if aer not in ratio_day.columns:
+                st.info(f"No hay serie diaria para {aer}.")
+                continue
+            ser = ratio_day[aer].loc[(ratio_day.index >= x0) & (ratio_day.index <= x1)].dropna()
             if ser.empty:
-                # Mostrar aviso pequeñito en el sitio del gráfico
+                st.info(f"{aer} — sin datos entre {NUM_A_MES[x0.month]} {x0.year} y {NUM_A_MES[x1.month]} {x1.year}")
+                continue
+            ser_ma7 = ratio_ma7[aer].loc[ser.index]
+
+            # TOPs: tomar por cada año del rango los primeros K
+            years_in_range = list(range(x0.year, x1.year + 1))
+            tops = (top90[(top90["Aerolínea"] == aer) & (top90["Año"].isin(years_in_range))]
+                    .sort_values(["Año","TOP"])
+                    .groupby("Año")
+                    .head(top_k))
+            title = f"{aer} — {NUM_A_MES[x0.month]} {x0.year} – {NUM_A_MES[x1.month]} {x1.year}"
+            fig = make_figure(ser, ser_ma7, tops, title, x0, x1, mode="acumulada")
+            st.plotly_chart(fig, use_container_width=True, key=f"chart-acc-{aer}-{x0}-{x1}-{top_k}")
+
+    else:
+        # Una figura por aerolínea × año dentro del rango
+        cols = st.columns(2)
+        idx = 0
+        for aer in sel_airlines:
+            if aer not in ratio_day.columns:
                 with cols[idx % 2]:
-                    st.info(f"{aer} — sin datos en {mes_ini}-{mes_fin} {y}")
+                    st.info(f"No hay serie diaria para {aer}.")
                 idx += 1
                 continue
 
-            ser_ma7 = ratio_ma7[aer].loc[ser.index]
+            for y in range(x0.year, x1.year + 1):
+                y0 = max(pd.Timestamp(year=y, month=1,  day=1), x0)
+                y1 = min(pd.Timestamp(year=y, month=12, day=31) + MonthEnd(0), x1)
 
-            # TOPs del año y aerolínea (se recortan visualmente al rango)
-            sub_top = (top90[(top90["Aerolínea"] == aer) & (top90["Año"] == int(y))]
-                       .sort_values("TOP").head(3))
+                ser = ratio_day[aer].loc[(ratio_day.index >= y0) & (ratio_day.index <= y1)].dropna()
+                if ser.empty:
+                    continue
+                ser_ma7 = ratio_ma7[aer].loc[ser.index]
 
-            fig = make_figure(ser, ser_ma7, sub_top, f"{aer} — {mes_ini}–{mes_fin} {y}")
+                tops_y = (top90[(top90["Aerolínea"] == aer) & (top90["Año"] == y)]
+                          .sort_values("TOP").head(top_k))
+                title = f"{aer} — {y} ({NUM_A_MES[y0.month]}–{NUM_A_MES[y1.month]})"
+                fig = make_figure(ser, ser_ma7, tops_y, title, y0, y1, mode="por_año")
+                with cols[idx % 2]:
+                    st.plotly_chart(fig, use_container_width=True, key=f"chart-year-{aer}-{y}-{y0.month}-{y1.month}-{top_k}")
+                idx += 1
 
-            with cols[idx % 2]:
-                st.plotly_chart(fig, use_container_width=True,
-                                key=f"chart-{aer}-{y}-{m_start:02d}-{m_end:02d}")
-            idx += 1
-
-# ----- TABLA -----
+# ================================
+# 3) TABLA
+# ================================
 st.header("3) Ventanas TOP (tabla)")
-mask = (top90["Aerolínea"].isin(sel_airlines)) & (top90["Año"].isin(sel_years))
-cols_deseadas = ["Aerolínea","Año","Inicio_90d","Fin_90d","Ratio_90d","VERDADEROS_90d","METARS_90d","TOP"]
-cols_presentes = [c for c in cols_deseadas if c in top90.columns]
-tabla = top90.loc[mask, cols_presentes].sort_values(["Aerolínea","Año","TOP"])
+
+years_mask = (top90["Año"] >= x0.year) & (top90["Año"] <= x1.year)
+mask = (top90["Aerolínea"].isin(sel_airlines)) & years_mask
+
+tabla_cols = ["Aerolínea","Año","Inicio_90d","Fin_90d","Ratio_90d","VERDADEROS_90d","METARS_90d","TOP"]
+tabla_cols = [c for c in tabla_cols if c in top90.columns]
+
+tabla = (top90.loc[mask, tabla_cols]
+         .sort_values(["Aerolínea","Año","TOP"])
+         .groupby(["Aerolínea","Año"], as_index=False)
+         .head(top_k))
 
 st.dataframe(
     tabla,
     use_container_width=True,
     hide_index=True,
-    key=f"tabla-{hash((tuple(sel_airlines), tuple(sel_years), m_start, m_end))}"
+    key=f"tabla-{hash((tuple(sel_airlines), x0.year, x1.year, x0.month, x1.month, top_k))}"
 )
 
 st.download_button(
     "⬇️ Descargar TOPs filtrados (CSV)",
     data=tabla.to_csv(index=False).encode("utf-8"),
-    file_name=f"top90_{'-'.join(map(str,sel_years))}_{m_start:02d}-{m_end:02d}.csv",
+    file_name=f"top90_{x0.year}-{x1.year}_{x0.month:02d}-{x1.month:02d}_top{top_k}.csv",
     mime="text/csv",
-    key=f"dl-{hash((tuple(sel_airlines), tuple(sel_years), m_start, m_end))}"
+    key=f"dl-{hash((tuple(sel_airlines), x0.year, x1.year, x0.month, x1.month, top_k))}"
 )
 
-st.caption("El rango de meses se aplica a todos los años seleccionados. Los TOP se asignan por el año del día inicial.")
+st.caption("Los TOP se asignan al **año del día inicial**. En modo *Acumulada* se ven todos los TOP de los años del rango en una misma línea temporal con separadores de año.")
