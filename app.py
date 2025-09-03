@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
-# App Streamlit – lectura interna de 'ratios_aeronaves_mensual_2014_2025.xlsx'
-# Selección: 1 categoría (CLAVE C y D / E295 / AT76 / AT75), rango de fechas libre (puede cruzar años)
-# Lógica:
-#  - CLAVE C y D = mezcla (promedio fila a fila) de columnas que contengan tokens de aerolíneas/jets
-#  - TOP = 1 (mejor ventana 90d por año, asignada al año del día inicial)
-#  - Gráfica acumulada con separadores de año y sombreado del TOP por año
-#  - “Moda” = mes de inicio más frecuente de esas ventanas TOP
-#  - Pestaña ILS: compara ILS operativo vs no operativo si hay hoja diaria ILS
+# App Streamlit — lee internamente 'ratios_aeronaves_mensual_2014_2025.xlsx'
+# - Selección: 1 categoría (CLAVE C y D / E295 / AT76 / AT75)
+# - Rango de fechas libre (puede cruzar años)
+# - TOP = 1 (mejor 90d por año)
+# - ILS: detectado en la HOJA 'Ratios_diarios' (columna con "ILS")
+# - Secciones: 1) Filtros  2) Gráficas (+ Moda)  3) Tabla  + pestaña Comparativa ILS
 
 from __future__ import annotations
 
@@ -21,7 +19,7 @@ from pandas.tseries.offsets import MonthEnd
 
 st.set_page_config(page_title="Top 90 días — categorías", layout="wide")
 
-# ====== Config carga interna ======
+# ====== Rutas candidatas (carga interna, sin mostrar al usuario) ======
 PATH_CANDIDATES = [
     Path("ratios_aeronaves_mensual_2014_2025.xlsx"),
     Path("data/ratios_aeronaves_mensual_2014_2025.xlsx"),
@@ -30,12 +28,12 @@ PATH_CANDIDATES = [
 
 # ====== Apariencia / colores ======
 COLORS = {
-    "daily":   "#7F8C8D",
-    "ma7":     "#111111",
-    "top1":    "#2E7D32",   # verde
-    "bgband":  "rgba(0,0,0,0.06)",
-    "op":      "#2E7D32",   # ILS operativo
-    "nop":     "#C0392B",   # ILS no operativo
+    "daily": "#7F8C8D",
+    "ma7":   "#111111",
+    "top1":  "#2E7D32",   # verde
+    "bgband":"rgba(0,0,0,0.06)",
+    "op":    "#2E7D32",   # ILS operativo
+    "nop":   "#C0392B",   # ILS no operativo
 }
 
 MESES = [
@@ -48,20 +46,15 @@ NUM_A_MES = {i:n for n,i in MESES}
 
 WINDOW_DAYS = 90
 
-# ====== Definición de categorías ======
-# Puedes ajustar los tokens si algún nombre de columna difiere en tu Excel.
+# ====== Definición de categorías (tokens para buscar columnas) ======
 CATEGORY_TOKENS: Dict[str, List[str]] = {
-    # Mezcla de aerolíneas comunes y familia de jets (CLAVE C/D)
     "CLAVE C y D": [
-        # Aerolíneas
-        "AEA", "RYR", "VLG", "VUELING", "IBE", "IBERIA", "EZY", "U2",
-        # Familia jets típicos clave C/D
-        "A320", "A321", "B737", "B738", "B739", "B38M", "B38X"
+        "AEA","RYR","VLG","VUELING","IBE","IBERIA","EZY","U2",
+        "A320","A321","B737","B738","B739","B38M","B38X"
     ],
-    # Estas suelen venir ya como columnas específicas
-    "E295": ["E295", "E190", "E195"],
-    "AT76": ["AT76", "ATR72"],
-    "AT75": ["AT75", "ATR72-500", "ATR75"],
+    "E295": ["E295","E190","E195"],
+    "AT76": ["AT76","ATR72"],
+    "AT75": ["AT75","ATR72-500","ATR75"],
 }
 
 # ====== Utilidades ======
@@ -71,17 +64,46 @@ def find_excel_path() -> Path:
         raise FileNotFoundError("No encuentro 'ratios_aeronaves_mensual_2014_2025.xlsx' en ./, ./data/ o /mnt/data/")
     return p
 
+TRUE_TOKENS = {"1","TRUE","VERDADERO","SI","SÍ","YES","Y"}
+FALSE_TOKENS = {"0","FALSE","FALSO","NO","N"}
+
+def map_to_bool_like(s: pd.Series) -> pd.Series:
+    """Mapea a 0/1 si es posible (numérico 0/1 o strings TRUE/FALSE/SI/NO). NaN -> NaN."""
+    if np.issubdtype(s.dtype, np.number):
+        v = s.astype(float)
+        m = v.isin([0.0,1.0])
+        out = pd.Series(np.where(v==1.0, 1, np.where(v==0.0, 0, np.nan)), index=s.index)
+        return out.where(m, np.nan)
+    up = s.astype(str).str.strip().str.upper()
+    out = np.where(up.isin(TRUE_TOKENS), 1, np.where(up.isin(FALSE_TOKENS), 0, np.nan))
+    return pd.Series(out, index=s.index)
+
+def detect_ils_column(df: pd.DataFrame) -> str | None:
+    """Devuelve el nombre de la mejor columna candidata de ILS en Ratios_diarios."""
+    cands = [c for c in df.columns if "ils" in c.lower()]
+    best = None; best_score = -1.0
+    for c in cands:
+        mapped = map_to_bool_like(df[c])
+        score = mapped.notna().mean()
+        # exigimos reconocimiento >= 0.7
+        if score >= 0.7 and score > best_score:
+            best = c; best_score = score
+    return best
+
 @st.cache_data(show_spinner=True)
 def load_all() -> Dict:
-    """Lee Top90 y (si existen) series diarias y estado ILS diario."""
+    """
+    Lee:
+      - Top90d_por_año (obligatoria) -> usaremos solo TOP=1 por año
+      - Ratios_diarios (opcional): ratios diarios por columna (aerolíneas/tipos) + posible columna ILS
+    """
     p = find_excel_path()
     xls = pd.ExcelFile(p)
     sheets = set(xls.sheet_names)
 
-    # ---- Top90d_por_año (obligatoria) ----
+    # ---- Top90d_por_año ----
     if "Top90d_por_año" not in sheets:
         raise ValueError("Falta la hoja 'Top90d_por_año' en el Excel.")
-
     top90 = pd.read_excel(xls, sheet_name="Top90d_por_año")
     ren = {}
     if "Aerolinea" in top90.columns: ren["Aerolinea"] = "Aerolínea"
@@ -96,46 +118,43 @@ def load_all() -> Dict:
     top90["Inicio_90d"] = pd.to_datetime(top90["Inicio_90d"])
     top90["Fin_90d"]    = pd.to_datetime(top90["Fin_90d"])
 
-    # si trae TOP 1/2/3, nos quedamos con TOP=1 (mejor)
+    # Quedarnos con TOP=1 por (Aerolínea, Año)
     if "TOP" in top90.columns:
-        top90_top1 = top90.sort_values(["Aerolínea","Año","Ratio_90d"], ascending=[True, True, False])\
-                          .groupby(["Aerolínea","Año"], as_index=False).head(1)
+        top90_top1 = (top90.sort_values(["Aerolínea","Año","Ratio_90d"], ascending=[True, True, False])
+                           .groupby(["Aerolínea","Año"], as_index=False).head(1))
     else:
-        # si no hay columna TOP, asumimos que ya es el mejor por año
         top90_top1 = top90.copy()
 
-    # ---- Ratios_diarios (opcional, recomendado) ----
+    # ---- Ratios_diarios ----
     ratio_day = ratio_ma7 = None
+    ils_flag = None  # Serie 0/1 (ILS operativo)
     if "Ratios_diarios" in sheets:
         rd = pd.read_excel(xls, sheet_name="Ratios_diarios")
+
         # detectar columna de fecha
         date_col = None
         for cand in ["Fecha","fecha","date","Date","index"]:
-            if cand in rd.columns:
-                date_col = cand; break
+            if cand in rd.columns: date_col = cand; break
         if date_col is None:
             date_col = rd.columns[0]
         rd[date_col] = pd.to_datetime(rd[date_col], errors="coerce")
         rd = rd[rd[date_col].notna()].copy().sort_values(date_col).set_index(date_col)
-        ratio_day = rd.astype(float)
-        ratio_ma7 = ratio_day.rolling(window=7, min_periods=1).mean()
 
-    # ---- ILS diario (opcional): hoja 'ILS_diario' con columnas ['Fecha','Operativo'] ----
-    ils_daily = None
-    if "ILS_diario" in sheets:
-        ils = pd.read_excel(xls, sheet_name="ILS_diario")
-        cdate = None
-        for cand in ["Fecha","fecha","date","Date"]:
-            if cand in ils.columns: cdate = cand; break
-        cop = None
-        for cand in ["Operativo","operativo","ILS_operativo","ILS"]:
-            if cand in ils.columns: cop = cand; break
-        if cdate and cop:
-            ils[cdate] = pd.to_datetime(ils[cdate], errors="coerce")
-            ils = ils[ils[cdate].notna()].copy().sort_values(cdate).set_index(cdate)
-            ils_daily = ils[[cop]].rename(columns={cop: "ILS_operativo"}).astype(int)
+        # detectar columna ILS en la propia hoja
+        ils_col = detect_ils_column(rd)
+        if ils_col:
+            ils_mapped = map_to_bool_like(rd[ils_col]).astype(float)
+            ils_flag = ils_mapped.where(ils_mapped.isin([0.0,1.0])).astype("float")
+            # limpiar columna ILS del dataframe de ratios
+            rd = rd.drop(columns=[ils_col])
 
-    return {"top90_top1": top90_top1, "ratio_day": ratio_day, "ratio_ma7": ratio_ma7, "ils_daily": ils_daily}
+        # ratios diarios (todas las demás columnas numéricas)
+        num_cols = [c for c in rd.columns if np.issubdtype(rd[c].dtype, np.number)]
+        if num_cols:
+            ratio_day = rd[num_cols].astype(float)
+            ratio_ma7 = ratio_day.rolling(window=7, min_periods=1).mean()
+
+    return {"top90_top1": top90_top1, "ratio_day": ratio_day, "ratio_ma7": ratio_ma7, "ils_flag": ils_flag}
 
 def columns_for_category(ratio_day: pd.DataFrame, category: str) -> List[str]:
     toks = [t.upper() for t in CATEGORY_TOKENS.get(category, [])]
@@ -149,32 +168,21 @@ def category_series(ratio_day: pd.DataFrame, members: List[str]) -> pd.Series:
     return ratio_day[members].mean(axis=1, skipna=True)
 
 def rolling90_top1_by_year(series: pd.Series, years: List[int]) -> pd.DataFrame:
-    """Devuelve, para cada año, la mejor ventana 90d (media de la serie) con start.year==año."""
+    """TOP 1 ventana 90d por año (inicio en ese año)."""
     s = series.sort_index()
     r90 = s.rolling(WINDOW_DAYS, min_periods=WINDOW_DAYS).mean()
     out = []
     for y in years:
-        # buscamos ventanas cuyo inicio esté en y
-        # fin = idx, inicio = idx - 89d
-        r90y = r90.copy()
-        r90y = r90y.dropna()
-        if r90y.empty:
-            continue
-        # filtra por inicio en año y
-        ok_idx = []
-        for end_ts, val in r90y.items():
+        r = r90.dropna()
+        if r.empty: continue
+        candidates = []
+        for end_ts, val in r.items():
             start_ts = end_ts - pd.Timedelta(days=WINDOW_DAYS-1)
             if start_ts.year == y:
-                ok_idx.append((end_ts, val, start_ts))
-        if not ok_idx:
-            continue
-        end_best, val_best, start_best = max(ok_idx, key=lambda t: t[1])
-        out.append({
-            "Año": y,
-            "Inicio_90d": start_best,
-            "Fin_90d": end_best,
-            "Ratio_90d": float(val_best),
-        })
+                candidates.append((start_ts, end_ts, float(val)))
+        if not candidates: continue
+        start_best, end_best, v = max(candidates, key=lambda t: t[2])
+        out.append({"Año": y, "Inicio_90d": start_best, "Fin_90d": end_best, "Ratio_90d": v})
     return pd.DataFrame(out)
 
 def year_ticks_lines(fig: go.Figure, start: pd.Timestamp, end: pd.Timestamp):
@@ -192,7 +200,7 @@ def make_range_figure(ser: pd.Series, ser_ma7: pd.Series,
                              line=dict(color=COLORS["daily"], width=2), name="Ratio diario"))
     fig.add_trace(go.Scatter(x=ser_ma7.index, y=ser_ma7.values, mode="lines",
                              line=dict(color=COLORS["ma7"], width=3), name="Media móvil 7d"))
-    # sombrear TOP1 por año
+
     for _, row in tops.sort_values("Año").iterrows():
         s = pd.to_datetime(row["Inicio_90d"])
         e = pd.to_datetime(row["Fin_90d"])
@@ -203,13 +211,14 @@ def make_range_figure(ser: pd.Series, ser_ma7: pd.Series,
         if m.any():
             fig.add_trace(go.Scatter(x=ser_ma7.index[m], y=ser_ma7[m].values, mode="lines",
                                      line=dict(color=COLORS["top1"], width=7),
-                                     name=f"TOP (90d) — {int(row['Año'])}",
+                                     name=f"TOP 90d — {int(row['Año'])}",
                                      showlegend=True))
         mid = s_plot + (e_plot - s_plot)/2
         y_mid = float(np.nanmedian(ser_ma7[(ser_ma7.index >= s_plot) & (ser_ma7.index <= e_plot)].values)) if m.any() else 0.6
         fig.add_annotation(x=mid, y=y_mid, text=f"{row['Ratio_90d']:.0%}",
                            showarrow=False, bgcolor="white",
                            bordercolor=COLORS["top1"], borderwidth=1, opacity=0.95)
+
     year_ticks_lines(fig, x0, x1)
     fig.update_layout(
         title=title,
@@ -221,7 +230,7 @@ def make_range_figure(ser: pd.Series, ser_ma7: pd.Series,
     return fig
 
 def month_mode_plot(tops: pd.DataFrame, title: str) -> go.Figure:
-    """Barra con conteo de mes de inicio más frecuente (la 'moda')."""
+    """Barra con el mes de inicio más frecuente (moda)."""
     if tops.empty:
         return go.Figure()
     months = pd.to_datetime(tops["Inicio_90d"]).dt.month
@@ -248,7 +257,7 @@ except Exception as e:
 top90_top1: pd.DataFrame = data["top90_top1"]
 ratio_day: pd.DataFrame | None = data["ratio_day"]
 ratio_ma7: pd.DataFrame | None = data["ratio_ma7"]
-ils_daily: pd.DataFrame | None = data["ils_daily"]
+ils_flag:  pd.Series  | None = data["ils_flag"]
 
 st.header("1) Filtros")
 c1, c2, c3 = st.columns([2,3,2])
@@ -283,8 +292,8 @@ x1 = pd.Timestamp(int(y_end),   MES_A_NUM[m_end],   1) + MonthEnd(1)
 # Preparar serie por categoría
 # ============================
 if ratio_day is None or ratio_ma7 is None:
-    st.warning("No está la hoja 'Ratios_diarios' en el Excel. Sin series diarias no podemos graficar ni recomputar ventanas. Muestra solo tabla.")
-    ser_cat = ser_cat_ma7 = None
+    st.warning("No está la hoja 'Ratios_diarios' o no es válida. Se mostrará solo la tabla.")
+    ser_cat = ser_cat_ma7 = ser_full = ser_full_ma7 = None
 else:
     members = columns_for_category(ratio_day, category)
     if not members:
@@ -292,8 +301,6 @@ else:
         st.stop()
     ser_full = category_series(ratio_day, members)
     ser_full_ma7 = ser_full.rolling(7, min_periods=1).mean()
-
-    # recorte a rango
     ser_cat = ser_full.loc[(ser_full.index >= x0) & (ser_full.index <= x1)].dropna()
     ser_cat_ma7 = ser_full_ma7.loc[ser_cat.index]
 
@@ -302,11 +309,11 @@ else:
 # ============================
 st.header("2) Gráficas")
 
-# TOP1 por año (recomputado desde la serie de categoría)
+# TOP1 por año (recomputado sobre la serie de categoría completa)
 tops_cat = pd.DataFrame()
-if ser_cat is not None and not ser_cat.empty:
+if ser_full is not None and not ser_full.empty:
     years_in_range = list(range(x0.year, x1.year + 1))
-    tops_cat = rolling90_top1_by_year(ser_full, years_in_range)  # usar serie completa para no truncar ventanas en bordes
+    tops_cat = rolling90_top1_by_year(ser_full, years_in_range)
 
 if ser_cat is None or ser_cat.empty:
     st.info("No hay datos diarios para ese rango/categoría.")
@@ -344,35 +351,32 @@ st.dataframe(tops_cat.sort_values("Año"), use_container_width=True, hide_index=
              key=f"tabla-{category}-{x0}-{x1}")
 
 # ============================
-# 4) ILS (comparativa) — pestaña
+# Comparativa ILS (usando columna ILS de Ratios_diarios)
 # ============================
-st.header("Comparativa ILS")
+st.header("Comparativa ILS (desde 'Ratios_diarios')")
+
 tab1, tab2 = st.tabs(["Descripción / requisitos", "Comparar operativo vs no operativo"])
 
 with tab1:
     st.markdown("""
-**Qué hace:** calcula el **TOP 90d** de la categoría elegida separando días con **ILS operativo** y con **ILS no operativo**, y los compara.
+**Qué hace:** separa el rango en días con **ILS operativo** (1) y **no operativo** (0) usando la **columna ILS detectada en `Ratios_diarios`**, y calcula el **TOP 90d** de la categoría para cada caso.
 
-**Requisito en el Excel**: hoja `ILS_diario` con columnas:
-- `Fecha`: día (YYYY-MM-DD)
-- `Operativo`: 1 (operativo) / 0 (no operativo)
-
-Si esta hoja no existe, no se puede calcular la comparativa.
+**Necesario:** que la hoja `Ratios_diarios` contenga una columna cuyo nombre incluya **“ILS”** y que sea booleana (0/1 o TRUE/FALSE o SI/NO).
 """)
 
 with tab2:
-    if ils_daily is None or ratio_day is None:
-        st.warning("No se encontró la hoja `ILS_diario` o faltan las series diarias. No es posible comparar.")
+    if ils_flag is None or ser_full is None:
+        st.warning("No se detectó columna ILS en 'Ratios_diarios' o faltan series diarias. No es posible comparar.")
     else:
-        # Alinear ILS con la serie de categoría
-        ils = ils_daily.reindex(ser_full.index).fillna(method="ffill").fillna(method="bfill")
-        op_mask = ils["ILS_operativo"] == 1
-        nop_mask = ils["ILS_operativo"] == 0
+        ils = ils_flag.copy().astype(float)
+        # alinación con la serie de categoría completa
+        idx_union = ser_full.index.union(ils.index)
+        ils = ils.reindex(idx_union).interpolate(limit_direction="both")  # relleno suave si faltan días
+        ser_full_al = ser_full.reindex(idx_union).interpolate(limit_direction="both")
 
-        # según rango
-        mask_range = (ser_full.index >= x0) & (ser_full.index <= x1)
-        s_op  = ser_full[mask_range & op_mask]
-        s_nop = ser_full[mask_range & nop_mask]
+        mask_range = (idx_union >= x0) & (idx_union <= x1)
+        op_mask  = (ils == 1.0) & mask_range
+        nop_mask = (ils == 0.0) & mask_range
 
         def top90_from_series(s: pd.Series) -> Tuple[pd.Timestamp, pd.Timestamp, float]:
             if s is None or s.empty: return None, None, np.nan
@@ -382,8 +386,8 @@ with tab2:
             start = end - pd.Timedelta(days=WINDOW_DAYS-1)
             return start, end, float(r.loc[end])
 
-        s1, e1, v1 = top90_from_series(s_op)
-        s2, e2, v2 = top90_from_series(s_nop)
+        s1, e1, v1 = top90_from_series(ser_full_al[op_mask])
+        s2, e2, v2 = top90_from_series(ser_full_al[nop_mask])
 
         c1, c2 = st.columns(2)
         with c1:
@@ -393,21 +397,18 @@ with tab2:
             st.metric("TOP 90d — ILS **no operativo**", f"{v2:.0%}" if not np.isnan(v2) else "—",
                       help=f"{s2.date()} → {e2.date()}" if s2 else "Sin ventana completa")
 
-        # Gráfica comparativa sobre el rango
-        ser_ma7_full = ser_full.rolling(7, min_periods=1).mean()
+        # Gráfica comparativa en el rango
+        ser_ma7_full = ser_full_al.rolling(7, min_periods=1).mean()
         fig = go.Figure()
         fig.add_hrect(y0=0, y1=1, line_width=0, fillcolor=COLORS["bgband"], opacity=0.25)
-        fig.add_trace(go.Scatter(x=ser_ma7_full[mask_range & op_mask].index,
-                                 y=ser_ma7_full[mask_range & op_mask].values,
-                                 mode="lines", name="MA7 — ILS operativo", line=dict(color=COLORS["op"], width=3)))
-        fig.add_trace(go.Scatter(x=ser_ma7_full[mask_range & nop_mask].index,
-                                 y=ser_ma7_full[mask_range & nop_mask].values,
-                                 mode="lines", name="MA7 — ILS no operativo", line=dict(color=COLORS["nop"], width=3)))
-        # sombrear ventanas si existen
-        if s1 and e1:
-            fig.add_vrect(x0=s1, x1=e1, fillcolor=COLORS["op"], opacity=0.18, line_width=0)
-        if s2 and e2:
-            fig.add_vrect(x0=s2, x1=e2, fillcolor=COLORS["nop"], opacity=0.18, line_width=0)
+        fig.add_trace(go.Scatter(x=ser_ma7_full[op_mask].index,  y=ser_ma7_full[op_mask].values,
+                                 mode="lines", name="MA7 — ILS operativo",
+                                 line=dict(color=COLORS["op"], width=3)))
+        fig.add_trace(go.Scatter(x=ser_ma7_full[nop_mask].index, y=ser_ma7_full[nop_mask].values,
+                                 mode="lines", name="MA7 — ILS no operativo",
+                                 line=dict(color=COLORS["nop"], width=3)))
+        if s1 and e1: fig.add_vrect(x0=s1, x1=e1, fillcolor=COLORS["op"],  opacity=0.18, line_width=0)
+        if s2 and e2: fig.add_vrect(x0=s2, x1=e2, fillcolor=COLORS["nop"], opacity=0.18, line_width=0)
         fig.update_layout(
             title=f"{category} — Comparativa ILS ({NUM_A_MES[x0.month]} {x0.year} – {NUM_A_MES[x1.month]} {x1.year})",
             yaxis=dict(title="Ratio", range=[0,1], tickformat=".0%"),
