@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Streamlit – Top 90d por categoría + Comparativa ILS (comparando columnas de Ratios_diarios)
-# Carga interna del Excel 'ratios_aeronaves_mensual_2014_2025.xlsx' (en ./, ./data o /mnt/data)
+# Streamlit – Top 90d por categoría + Comparativa ILS (columnas de Ratios_diarios)
+# Sin selector de ILS en filtros. Colores mejorados y etiquetas de ventanas visibles.
 
 from __future__ import annotations
 
@@ -24,13 +24,15 @@ PATHS = [
 
 # ====== Apariencia / colores ======
 COLORS = {
-    "daily": "#E74C3C",   # rojo: categoría (diario)
-    "ma7":   "#111111",   # MA7 para panel principal
-    "top1":  "#2E7D32",   # sombreado TOP
-    "bgband":"rgba(0,0,0,0.06)",
-    "ils":   "#2ECC71",   # verde: ILS (columna elegida)
-    "diff+": "#2ECC71",   # diferencia positiva (cat > ILS)
-    "diff-": "#E67E22",   # diferencia negativa (cat < ILS)
+    "daily": "#F97316",   # naranja: categoría (diario)
+    "ma7":   "#FFFFFF",   # blanco: MA7
+    "top1":  "rgba(16,185,129,0.22)",  # verde-teal suave para sombreado
+    "top1_border": "#0F766E",          # borde/etiqueta
+    "bgband":"rgba(255,255,255,0.05)", # banda de fondo
+    "ils":   "#22C55E",   # verde: columna ILS (diario)
+    "diff+": "#22C55E",   # diferencia positiva (cat > ILS)
+    "diff-": "#F97316",   # diferencia negativa (cat < ILS) naranja
+    "grid":  "#4B5563",
 }
 
 MESES = [
@@ -65,12 +67,13 @@ def _find_path() -> Path:
 def load_all() -> Dict:
     """
     Lee:
-      - 'Top90d_por_año' (obligatoria) -> nos quedamos con TOP=1 por año
-      - 'Ratios_diarios' (obligatoria para gráficas): ratios diarios por columna, incluida(s) columna(s) ILS
+      - 'Top90d_por_año' -> TOP=1 por año
+      - 'Ratios_diarios' -> series diarias + columna(s) ILS
     """
     xls = pd.ExcelFile(_find_path())
     sheets = set(xls.sheet_names)
 
+    # ---- Top90d_por_año ----
     if "Top90d_por_año" not in sheets:
         raise ValueError("Falta la hoja 'Top90d_por_año' en el Excel.")
     top90 = pd.read_excel(xls, sheet_name="Top90d_por_año")
@@ -78,54 +81,42 @@ def load_all() -> Dict:
     if "Aerolinea" in top90.columns: ren["Aerolinea"] = "Aerolínea"
     if "Ano" in top90.columns: ren["Ano"] = "Año"
     top90 = top90.rename(columns=ren)
-
     need = {"Aerolínea","Año","Inicio_90d","Fin_90d","Ratio_90d"}
     miss = need - set(top90.columns)
     if miss:
         raise ValueError(f"En 'Top90d_por_año' faltan columnas: {miss}")
-
     top90["Inicio_90d"] = pd.to_datetime(top90["Inicio_90d"])
     top90["Fin_90d"]    = pd.to_datetime(top90["Fin_90d"])
-
-    # TOP=1 por (Aerolínea, Año)
     if "TOP" in top90.columns:
         top90_top1 = (top90.sort_values(["Aerolínea","Año","Ratio_90d"], ascending=[True, True, False])
                            .groupby(["Aerolínea","Año"], as_index=False).head(1))
     else:
         top90_top1 = top90.copy()
 
+    # ---- Ratios_diarios ----
     if "Ratios_diarios" not in sheets:
         raise ValueError("Falta la hoja 'Ratios_diarios' en el Excel.")
-
     rd = pd.read_excel(xls, sheet_name="Ratios_diarios")
-
-    # detectar columna de fecha
-    date_col = None
-    for cand in ["Fecha","FECHA","fecha","date","Date","index"]:
-        if cand in rd.columns:
-            date_col = cand; break
-    if date_col is None:
-        date_col = rd.columns[0]
-
+    # fecha
+    date_col = next((c for c in ["Fecha","FECHA","fecha","date","Date","index"] if c in rd.columns), rd.columns[0])
     rd[date_col] = pd.to_datetime(rd[date_col], errors="coerce")
     rd = rd[rd[date_col].notna()].copy().sort_values(date_col).set_index(date_col)
-
-    # numéricas
+    # columnas numéricas
     num_cols = [c for c in rd.columns if np.issubdtype(rd[c].dtype, np.number)]
     ratio_day = rd[num_cols].astype(float)
     ratio_ma7 = ratio_day.rolling(window=7, min_periods=1).mean()
 
-    # columnas ILS candidatas
-    ils_cols = [c for c in ratio_day.columns if "ils" in c.lower()]
-    # prefijar ILS Cat.1 si existe
-    default_ils = "ILS Cat.1" if "ILS Cat.1" in ratio_day.columns else (ils_cols[0] if ils_cols else None)
+    # detectar ILS (prioriza 'ILS Cat.1', si no, primera que contenga 'ils')
+    ils_candidates = [c for c in ratio_day.columns if "ils" in c.lower()]
+    ils_col = "ILS Cat.1" if "ILS Cat.1" in ratio_day.columns else (ils_candidates[0] if ils_candidates else None)
+    if ils_col is None:
+        raise ValueError("No se detectó ninguna columna con 'ILS' en 'Ratios_diarios'.")
 
     return {
         "top90_top1": top90_top1,
         "ratio_day": ratio_day,
         "ratio_ma7": ratio_ma7,
-        "ils_cols": ils_cols,
-        "default_ils": default_ils,
+        "ils_col": ils_col,
         "all_years": sorted(top90_top1["Año"].unique().tolist())
     }
 
@@ -146,7 +137,7 @@ def rolling90_top1_by_year(series: pd.Series, years: List[int]) -> pd.DataFrame:
             start_ts = end_ts - pd.Timedelta(days=WINDOW_DAYS-1)
             if start_ts.year == y:
                 candidates.append((start_ts, end_ts, float(val)))
-        if not candidates: 
+        if not candidates:
             continue
         start_best, end_best, v = max(candidates, key=lambda t: t[2])
         out.append({"Año": y, "Inicio_90d": start_best, "Fin_90d": end_best, "Ratio_90d": v})
@@ -155,31 +146,41 @@ def rolling90_top1_by_year(series: pd.Series, years: List[int]) -> pd.DataFrame:
 def year_lines(fig: go.Figure, start: pd.Timestamp, end: pd.Timestamp):
     y = start.year + 1
     while y <= end.year:
-        fig.add_vline(x=pd.Timestamp(y,1,1), line_width=1, line_dash="dot", line_color="#555")
+        fig.add_vline(x=pd.Timestamp(y,1,1), line_width=1, line_dash="dot", line_color=COLORS["grid"])
         y += 1
 
 def figure_main(ser: pd.Series, ser_ma7: pd.Series,
                 tops: pd.DataFrame, title: str,
                 x0: pd.Timestamp, x1: pd.Timestamp) -> go.Figure:
     fig = go.Figure()
-    fig.add_hrect(y0=0, y1=1, line_width=0, fillcolor=COLORS["bgband"], opacity=0.35)
+    fig.add_hrect(y0=0, y1=1, line_width=0, fillcolor=COLORS["bgband"], opacity=1.0)
     fig.add_trace(go.Scatter(x=ser.index, y=ser.values, mode="lines",
-                             line=dict(color=COLORS["daily"], width=2), name="Ratio diario (categoría)"))
+                             line=dict(color=COLORS["daily"], width=2.2), name="Ratio diario (categoría)"))
     fig.add_trace(go.Scatter(x=ser_ma7.index, y=ser_ma7.values, mode="lines",
-                             line=dict(color=COLORS["ma7"], width=3), name="Media móvil 7d"))
-    # sombreado de TOP por año (sin leyenda)
+                             line=dict(color=COLORS["ma7"], width=2.8), name="Media móvil 7d"))
+    # sombreado de TOP por año (sin leyenda) + etiqueta grande visible
     for _, row in tops.sort_values("Año").iterrows():
         s = pd.to_datetime(row["Inicio_90d"])
         e = pd.to_datetime(row["Fin_90d"])
         s_plot, e_plot = max(s, x0), min(e, x1)
-        if s_plot > e_plot: 
+        if s_plot > e_plot:
             continue
-        fig.add_vrect(x0=s_plot, x1=e_plot, fillcolor=COLORS["top1"], opacity=0.18, line_width=0)
+        fig.add_vrect(x0=s_plot, x1=e_plot, fillcolor=COLORS["top1"], opacity=1.0, line_width=0)
+        # etiqueta: arriba del tramo
+        mask = (ser_ma7.index >= s_plot) & (ser_ma7.index <= e_plot)
+        y_top = np.nanmax(ser_ma7[mask].values) if mask.any() else 0.96
+        y_top = float(min(0.98, y_top + 0.01))
         mid = s_plot + (e_plot - s_plot)/2
-        y_mid = float(np.nanmedian(ser_ma7[(ser_ma7.index >= s_plot) & (ser_ma7.index <= e_plot)].values)) if not ser_ma7.empty else 0.6
-        fig.add_annotation(x=mid, y=y_mid, text=f"{row['Ratio_90d']:.0%}",
-                           showarrow=False, bgcolor="white",
-                           bordercolor=COLORS["top1"], borderwidth=1, opacity=0.95)
+        fig.add_annotation(
+            x=mid, y=y_top,
+            text=f"{row['Ratio_90d']:.0%}",
+            showarrow=False,
+            font=dict(size=16, color="#0B0F10", family="Inter, system-ui"),
+            bgcolor="#FFFFFF",
+            bordercolor=COLORS["top1_border"],
+            borderwidth=1.5,
+            opacity=0.98
+        )
 
     year_lines(fig, x0, x1)
     fig.update_layout(
@@ -193,8 +194,7 @@ def figure_main(ser: pd.Series, ser_ma7: pd.Series,
 
 def ils_compare_timeseries(cat: pd.Series, ils: pd.Series,
                            x0: pd.Timestamp, x1: pd.Timestamp, title: str) -> go.Figure:
-    """Comparativa: línea roja = categoría (diario), línea verde = columna ILS (diario)"""
-    # alinear y recortar
+    """Comparativa: línea naranja = categoría (diario), línea verde = columna ILS (diario)"""
     idx = cat.index.union(ils.index)
     cat_u = cat.reindex(idx).interpolate(limit_direction="both")
     ils_u = ils.reindex(idx).interpolate(limit_direction="both")
@@ -202,11 +202,11 @@ def ils_compare_timeseries(cat: pd.Series, ils: pd.Series,
     cat_u, ils_u = cat_u[m], ils_u[m]
 
     fig = go.Figure()
-    fig.add_hrect(y0=0, y1=1, line_width=0, fillcolor=COLORS["bgband"], opacity=0.25)
+    fig.add_hrect(y0=0, y1=1, line_width=0, fillcolor=COLORS["bgband"], opacity=1.0)
     fig.add_trace(go.Scatter(x=cat_u.index, y=cat_u.values, mode="lines",
-                             name="Categoría (diario)", line=dict(color=COLORS["daily"], width=2)))
+                             name="Categoría (diario)", line=dict(color=COLORS["daily"], width=1.8)))
     fig.add_trace(go.Scatter(x=ils_u.index, y=ils_u.values, mode="lines",
-                             name="ILS (diario)", line=dict(color=COLORS["ils"], width=2)))
+                             name="ILS (diario)", line=dict(color=COLORS["ils"], width=1.8)))
     year_lines(fig, x0, x1)
     fig.update_layout(
         title=title,
@@ -226,10 +226,10 @@ def ils_diff_chart(cat: pd.Series, ils: pd.Series,
     m = (idx >= x0) & (idx <= x1)
     idx, diff = idx[m], (cat_u - ils_u)[m]
 
-    fig = go.Figure()
     colors = np.where(diff >= 0, COLORS["diff+"], COLORS["diff-"])
+    fig = go.Figure()
     fig.add_bar(x=idx, y=diff.values, marker_color=list(colors))
-    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="#555")
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color=COLORS["grid"])
     fig.update_layout(
         title=title,
         yaxis=dict(title="Cat − ILS", tickformat="+.0%"),
@@ -249,14 +249,13 @@ except Exception as e:
     st.stop()
 
 top90_top1: pd.DataFrame = data["top90_top1"]
-ratio_day: pd.DataFrame = data["ratio_day"]
-ratio_ma7: pd.DataFrame = data["ratio_ma7"]
-ils_cols:  List[str]     = data["ils_cols"]
-default_ils: str | None  = data["default_ils"]
-years_all: List[int]     = data["all_years"]
+ratio_day: pd.DataFrame   = data["ratio_day"]
+ratio_ma7: pd.DataFrame   = data["ratio_ma7"]
+ils_col: str              = data["ils_col"]
+years_all: List[int]      = data["all_years"]
 
 st.header("1) Filtros")
-c1, c2, c3 = st.columns([2,3,3])
+c1, c2, c3 = st.columns([2,3,2])
 
 with c1:
     category = st.selectbox("Categoría", ["CLAVE C y D", "E295", "AT76", "AT75"], index=0)
@@ -271,8 +270,6 @@ with c2:
         m_end   = st.selectbox("Mes fin", options=[n for n,_ in MESES], index=11)
 
 with c3:
-    ils_col = st.selectbox("Columna ILS a comparar", options=ils_cols or ["(no hay columnas ILS)"],
-                           index=(ils_cols.index(default_ils) if (ils_cols and default_ils in ils_cols) else 0))
     mode = st.radio("Modo de gráfica", ["Acumulada (rango completo)","Una por año"], index=0)
 
 # Validación rango
@@ -285,7 +282,7 @@ if start_key > end_key:
 x0 = pd.Timestamp(int(y_start), MES_A_NUM[m_start], 1)
 x1 = pd.Timestamp(int(y_end),   MES_A_NUM[m_end],   1) + MonthEnd(1)
 
-# Serie por categoría (diaria y MA7 para panel principal)
+# Serie por categoría
 members = cols_for_category(ratio_day, category)
 if not members:
     st.error(f"No encontré columnas que encajen con '{category}'. Ajusta CATEGORY_TOKENS.")
@@ -300,11 +297,8 @@ ser_range_ma7 = ser_full_ma7.loc[ser_range.index]
 st.header("2) Gráficas")
 
 # TOP1 por año (recalculado sobre la serie agregada)
-def _top1(series: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    yrs = list(range(start.year, end.year+1))
-    return rolling90_top1_by_year(series, yrs)
-
-tops_cat = _top1(ser_full, x0, x1)
+years_in_range = list(range(x0.year, x1.year + 1))
+tops_cat = rolling90_top1_by_year(ser_full, years_in_range)
 
 if ser_range.empty:
     st.info("No hay datos diarios para ese rango/categoría.")
@@ -319,7 +313,7 @@ else:
     else:
         cols = st.columns(2)
         idx = 0
-        for y in range(x0.year, x1.year+1):
+        for y in years_in_range:
             y0 = max(pd.Timestamp(y,1,1), x0)
             y1 = min(pd.Timestamp(y,12,31)+MonthEnd(0), x1)
             ser_y = ser_full.loc[(ser_full.index >= y0) & (ser_full.index <= y1)].dropna()
@@ -332,47 +326,22 @@ else:
                 st.plotly_chart(figy, use_container_width=True, key=f"year-{category}-{y}-{y0.month}-{y1.month}")
             idx += 1
 
-# =============== 3) Tabla TOP ===============
-st.header("3) Tabla de ventanas TOP (recomputadas)")
-st.dataframe(tops_cat.sort_values("Año"), use_container_width=True, hide_index=True,
-             key=f"tabla-{category}-{x0}-{x1}")
-
-# =============== 4) Comparativa ILS (comparando columnas) ===============
+# =============== 3) Comparativa ILS (solo gráficas) ===============
 st.header("Comparativa ILS (columnas de Ratios_diarios)")
 
-if not ils_cols:
-    st.warning("No se detectaron columnas con 'ILS' en 'Ratios_diarios'.")
-else:
-    ils_series = ratio_day[ils_col].astype(float)
+# Serie ILS automática
+ils_series = ratio_day[ils_col].astype(float)
 
-    # 4.1 Serie diaria: rojo (categoría) vs verde (ILS)
-    fig_ils = ils_compare_timeseries(
-        ser_full, ils_series, x0, x1,
-        f"{category} vs {ils_col} — {NUM_A_MES[x0.month]} {x0.year} – {NUM_A_MES[x1.month]} {x1.year}"
-    )
-    st.plotly_chart(fig_ils, use_container_width=True, key=f"ils-ts-{category}-{ils_col}-{x0}-{x1}")
+# 3.1 Serie diaria: naranja (categoría) vs verde (ILS)
+fig_ils = ils_compare_timeseries(
+    ser_full, ils_series, x0, x1,
+    f"{category} vs {ils_col} — {NUM_A_MES[x0.month]} {x0.year} – {NUM_A_MES[x1.month]} {x1.year}"
+)
+st.plotly_chart(fig_ils, use_container_width=True, key=f"ils-ts-{category}-{x0}-{x1}")
 
-    # 4.2 Diferencia (cat − ILS)
-    fig_diff = ils_diff_chart(
-        ser_full, ils_series, x0, x1,
-        f"Diferencia diaria (Categoría − {ils_col})"
-    )
-    st.plotly_chart(fig_diff, use_container_width=True, key=f"ils-diff-{category}-{ils_col}-{x0}-{x1}")
-
-    # 4.3 Métricas resumen del rango
-    idx_union = ser_full.index.union(ils_series.index)
-    cat_u = ser_full.reindex(idx_union).interpolate(limit_direction="both")
-    ils_u = ils_series.reindex(idx_union).interpolate(limit_direction="both")
-    mask = (idx_union >= x0) & (idx_union <= x1)
-    cat_r = cat_u[mask].dropna()
-    ils_r = ils_u[mask].dropna()
-    diff = (cat_r - ils_r).dropna()
-
-    def _fmt(x): return f"{x:.0%}" if x==x else "—"
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Mediana categoría", _fmt(cat_r.median() if not cat_r.empty else np.nan))
-    with c2:
-        st.metric(f"Mediana {ils_col}", _fmt(ils_r.median() if not ils_r.empty else np.nan))
-    with c3:
-        st.metric("Δ mediana (cat − ILS)", _fmt(diff.median() if not diff.empty else np.nan))
+# 3.2 Diferencia (cat − ILS)
+fig_diff = ils_diff_chart(
+    ser_full, ils_series, x0, x1,
+    f"Diferencia diaria (Categoría − {ils_col})"
+)
+st.plotly_chart(fig_diff, use_container_width=True, key=f"ils-diff-{category}-{x0}-{x1}")
