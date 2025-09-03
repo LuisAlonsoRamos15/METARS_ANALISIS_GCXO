@@ -231,7 +231,7 @@ def month_mode_hist(tops: pd.DataFrame, title: str) -> go.Figure:
     return fig
 
 # =============== 1) FILTROS ===============
-st.title("📊 Top 90 días — por categoría")
+st.title("Top 90 días — por categoría")
 
 # Carga
 try:
@@ -356,3 +356,4 @@ st.plotly_chart(
     use_container_width=True,
     key=f"ils-diff-{category}-{x0}-{x1}"
 )
+
