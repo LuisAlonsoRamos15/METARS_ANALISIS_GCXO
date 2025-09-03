@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
-# Streamlit: leer 'ratios_aeronaves_mensual_2014_2025.xlsx'
+# Streamlit: leer 'ratios_aeronaves_mensual_2014_2025.xlsx' desde ruta local (sin uploader)
 # Selección: Aerolíneas + Año + Mes inicio/fin (mismo año)
-# Muestra curvas diarias (si existe 'Ratios_diarios') y sombrea TOP 1/2/3 (90d) del año.
-# Soluciona StreamlitDuplicateElementId con keys únicos.
+# Curvas diarias si existe 'Ratios_diarios'. Sombrea TOP 1/2/3 (90d) del año.
 
 from __future__ import annotations
 
-import io
 from pathlib import Path
 from typing import List, Dict
 
@@ -38,19 +36,24 @@ MES_A_NUM = {n:i for n,i in MESES}
 
 # ---------- carga desde el Excel de ratios ----------
 @st.cache_data(show_spinner=True)
-def load_from_ratios_excel(file_bytes: bytes) -> Dict:
-    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+def load_from_ratios_excel(path_str: str) -> Dict:
+    p = Path(path_str)
+    if not p.exists():
+        raise FileNotFoundError(f"No encuentro el archivo: {p.resolve()}")
+
+    xls = pd.ExcelFile(p)  # leemos directamente desde ruta
     sheets = set(xls.sheet_names)
 
     if "Top90d_por_año" not in sheets:
         raise ValueError("Falta la hoja 'Top90d_por_año' en el Excel.")
 
     top90 = pd.read_excel(xls, sheet_name="Top90d_por_año")
+
     # normaliza nombres
-    if "Aerolinea" in top90.columns:
-        top90 = top90.rename(columns={"Aerolinea": "Aerolínea"})
-    if "Ano" in top90.columns:
-        top90 = top90.rename(columns={"Ano": "Año"})
+    ren = {}
+    if "Aerolinea" in top90.columns: ren["Aerolinea"] = "Aerolínea"
+    if "Ano" in top90.columns: ren["Ano"] = "Año"
+    top90 = top90.rename(columns=ren)
 
     required = {"Aerolínea","Año","Inicio_90d","Fin_90d","Ratio_90d"}
     missing = required - set(top90.columns)
@@ -72,6 +75,7 @@ def load_from_ratios_excel(file_bytes: bytes) -> Dict:
     ratio_day = ratio_ma7 = None
     if "Ratios_diarios" in sheets:
         rd = pd.read_excel(xls, sheet_name="Ratios_diarios")
+
         # detectar columna de fecha
         date_col = None
         for cand in ["Fecha","fecha","date","Date","index"]:
@@ -79,6 +83,7 @@ def load_from_ratios_excel(file_bytes: bytes) -> Dict:
                 date_col = cand; break
         if date_col is None:
             date_col = rd.columns[0]
+
         rd[date_col] = pd.to_datetime(rd[date_col], errors="coerce")
         rd = rd[rd[date_col].notna()].copy().sort_values(date_col).set_index(date_col)
 
@@ -142,23 +147,15 @@ st.title("📊 Top 90 días por aerolínea (Excel de ratios)")
 st.caption("Selecciona Aerolínea(s), **Año** y **Mes inicio/fin** (mismo año). Se sombrea TOP 1/2/3 (90 días).")
 
 with st.sidebar:
-    st.header("1) Archivo de ratios")
-    origen = st.radio("Origen", ["Ruta local", "Subir Excel"], index=0)
+    st.header("1) Archivo de ratios (ruta local)")
+    ruta = st.text_input("Ruta del Excel", value=DEFAULT_RATIOS_XLSX)
 
-data = None
-if origen == "Ruta local":
-    ruta = st.sidebar.text_input("Ruta del Excel", value=DEFAULT_RATIOS_XLSX)
-    p = Path(ruta)
-    if not p.exists():
-        st.error(f"No encuentro el archivo: {p.resolve()}")
-        st.stop()
-    data = load_from_ratios_excel(p.read_bytes())
-else:
-    up = st.sidebar.file_uploader("Sube el Excel de ratios (*.xlsx)", type=["xlsx"])
-    if up is None:
-        st.info("Sube el Excel o usa 'Ruta local'.")
-        st.stop()
-    data = load_from_ratios_excel(up.getvalue())
+# Cargar datos (solo local)
+try:
+    data = load_from_ratios_excel(ruta)
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
 top90: pd.DataFrame = data["top90"]
 ratio_day: pd.DataFrame | None = data["ratio_day"]
@@ -180,6 +177,10 @@ with c3:
     with col_m2:
         mes_fin = st.selectbox("Mes fin", options=[n for n,_ in MESES], index=11)
 
+if not sel_airlines:
+    st.warning("Selecciona al menos una aerolínea.")
+    st.stop()
+
 if MES_A_NUM[mes_ini] > MES_A_NUM[mes_fin]:
     st.warning("El mes de inicio no puede ser posterior al mes fin (rango dentro del MISMO año).")
     st.stop()
@@ -193,7 +194,6 @@ if ratio_day is None or ratio_ma7 is None:
     st.warning("No está la hoja 'Ratios_diarios' en el Excel. Sólo se mostrará la tabla inferior.")
 else:
     st.header("3) Gráficas")
-    # grid 2 columnas, keys únicos para evitar DuplicateElementId
     cols = st.columns(2)
     idx = 0
     for aer in sel_airlines:
@@ -206,7 +206,6 @@ else:
             continue
         ser_ma7 = ratio_ma7[aer].loc[ser.index]
 
-        # TOPs del año seleccionado (se recortan visualmente al rango)
         sub_top = (top90[(top90["Aerolínea"] == aer) & (top90["Año"] == int(year))]
                    .sort_values("TOP").head(3))
         fig = make_figure(ser, ser_ma7, sub_top, f"{aer} — {mes_ini}–{mes_fin} {year}")
@@ -215,16 +214,15 @@ else:
             st.plotly_chart(fig, use_container_width=True, key=f"chart-{aer}-{year}-{mes_ini}-{mes_fin}")
         idx += 1
 
-# ----- TABLA (con key único) -----
+# ----- TABLA -----
 st.header("4) Ventanas TOP (tabla)")
 mask = (top90["Aerolínea"].isin(sel_airlines)) & (top90["Año"] == int(year))
-tabla = top90.loc[mask, ["Aerolínea","Año","Inicio_90d","Fin_90d","Ratio_90d","VERDADEROS_90d","METARS_90d","TOP"]]
-st.dataframe(
-    tabla.sort_values(["Aerolínea","TOP"]),
-    use_container_width=True,
-    hide_index=True,
-    key=f"tabla-{hash((tuple(sel_airlines), year, mes_ini, mes_fin))}"
-)
+cols_deseadas = ["Aerolínea","Año","Inicio_90d","Fin_90d","Ratio_90d","VERDADEROS_90d","METARS_90d","TOP"]
+cols_presentes = [c for c in cols_deseadas if c in top90.columns]
+tabla = top90.loc[mask, cols_presentes].sort_values(["Aerolínea","TOP"])
+st.dataframe(tabla, use_container_width=True, hide_index=True,
+             key=f"tabla-{hash((tuple(sel_airlines), year, mes_ini, mes_fin))}")
+
 st.download_button(
     "⬇️ Descargar TOPs filtrados (CSV)",
     data=tabla.to_csv(index=False).encode("utf-8"),
@@ -232,4 +230,5 @@ st.download_button(
     mime="text/csv",
     key=f"dl-{hash((tuple(sel_airlines), year, mes_ini, mes_fin))}"
 )
-st.caption("Rango de meses dentro del mismo año. Los TOP se asignan por el año del día inicial y se sombrean únicamente en el tramo que cae dentro del rango.")
+
+st.caption("Rango de meses dentro del mismo año. Los TOP se asignan por el año del día inicial.")
