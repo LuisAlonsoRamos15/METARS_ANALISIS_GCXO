@@ -163,7 +163,7 @@ ratio_ma7: pd.DataFrame | None = data["ratio_ma7"]
 airlines: List[str] = data["airlines"]
 
 # -- Filtros superiores --
-st.header("2) Filtros")
+st.header("1) Filtros")
 c1, c2, c3 = st.columns([2,1,2])
 with c1:
     sel_airlines = st.multiselect("Aerolíneas", options=airlines, default=airlines[:min(4,len(airlines))])
@@ -193,7 +193,7 @@ fin = pd.Timestamp(year=int(year), month=MES_A_NUM[mes_fin], day=1) + MonthEnd(1
 if ratio_day is None or ratio_ma7 is None:
     st.warning("No está la hoja 'Ratios_diarios' en el Excel. Sólo se mostrará la tabla inferior.")
 else:
-    st.header("3) Gráficas")
+    st.header("2) Gráficas")
     cols = st.columns(2)
     idx = 0
     for aer in sel_airlines:
@@ -215,7 +215,7 @@ else:
         idx += 1
 
 # ----- TABLA -----
-st.header("4) Ventanas TOP (tabla)")
+st.header("3) Ventanas TOP (tabla)")
 mask = (top90["Aerolínea"].isin(sel_airlines)) & (top90["Año"] == int(year))
 cols_deseadas = ["Aerolínea","Año","Inicio_90d","Fin_90d","Ratio_90d","VERDADEROS_90d","METARS_90d","TOP"]
 cols_presentes = [c for c in cols_deseadas if c in top90.columns]
@@ -232,3 +232,4 @@ st.download_button(
 )
 
 st.caption("Rango de meses dentro del mismo año. Los TOP se asignan por el año del día inicial.")
+
