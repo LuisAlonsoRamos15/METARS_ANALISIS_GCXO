@@ -41,6 +41,7 @@ COLORS = {
     "diff+": "#22C55E",
     "diff-": "#F97316",
     "bar":   "#0EA5E9",
+    "prog": "#EF4444"
 }
 
 MESES = [
@@ -396,7 +397,7 @@ def smape_series(y_real: pd.Series, y_hat: pd.Series) -> pd.Series:
 def _pretty_tfn(col: str) -> str:
     return "CLAVE C y D" if col == "ops_teoricas__Vueling" else col.replace("ops_teoricas__", "").replace("_", " ").strip()
 
-st.header("Teoría ILS vs Operativa Real")
+st.header("Estudio de Operaciones de Llegada en RWY30")
 
 _tfn_path = _find_tfn_path()
 if _tfn_path is None:
@@ -441,12 +442,30 @@ else:
         # ================= Gráfica según VISTA =================
         if view == "ILS":
             fig = go.Figure()
-            fig.update_layout(hovermode="x unified", xaxis_title="Fecha", yaxis_title="Operaciones", height=520)
-            fig.add_trace(go.Scatter(x=_df_f["fecha_utc"], y=y_real, mode="lines", name="Real"))
+            fig.update_layout(
+                hovermode="x unified",
+                xaxis_title="Fecha",
+                yaxis_title="Operaciones",
+                height=520
+            )
+            # Real
+            fig.add_trace(go.Scatter(
+                x=_df_f["fecha_utc"], y=y_real, mode="lines",
+                name="Real"
+            ))
+            # Teoría ILS
             if "ops_teoricas_ILS Cat.1" in _df_f.columns:
-                fig.add_trace(go.Scatter(x=_df_f["fecha_utc"], y=y_ils,  mode="lines", name="Teoría ILS"))
-            fig.update_xaxes(rangeslider=dict(visible=True))
+                fig.add_trace(go.Scatter(
+                    x=_df_f["fecha_utc"], y=y_ils, mode="lines",
+                    name="Teoría ILS"
+                ))
+            # Programadas (línea roja)
+            fig.add_trace(go.Scatter(
+                x=_df_f["fecha_utc"], y=y_tot, mode="lines",
+                name="Programadas", line=dict(color=COLORS.get("prog", "#EF4444"), width=1.6)
+            ))
             st.plotly_chart(fig, use_container_width=True, key=f"tfn-ils-real-{x0}-{x1}")
+        
         else:  # Sin ILS (CLAVE C y D)
             tipo_col = "ops_teoricas__Vueling" if "ops_teoricas__Vueling" in _df_f.columns else None
             if tipo_col is None:
@@ -454,112 +473,28 @@ else:
             else:
                 y_tipo = pd.to_numeric(_df_f[tipo_col], errors="coerce")
                 figb = go.Figure()
-                figb.update_layout(hovermode="x unified", xaxis_title="Fecha", yaxis_title="Operaciones", height=520)
-                figb.add_trace(go.Scatter(x=_df_f["fecha_utc"], y=y_real, mode="lines", name="Real"))
-                figb.add_trace(go.Scatter(x=_df_f["fecha_utc"], y=y_tipo, mode="lines", name=_pretty_tfn(tipo_col)))
-                figb.update_xaxes(rangeslider=dict(visible=True))
+                figb.update_layout(
+                    hovermode="x unified",
+                    xaxis_title="Fecha",
+                    yaxis_title="Operaciones",
+                    height=520
+                )
+                # Real
+                figb.add_trace(go.Scatter(
+                    x=_df_f["fecha_utc"], y=y_real, mode="lines",
+                    name="Real"
+                ))
+                # Teoría por tipo (CLAVE C y D)
+                figb.add_trace(go.Scatter(
+                    x=_df_f["fecha_utc"], y=y_tipo, mode="lines",
+                    name=_pretty_tfn(tipo_col)
+                ))
+                # Programadas (línea roja)
+                figb.add_trace(go.Scatter(
+                    x=_df_f["fecha_utc"], y=y_tot, mode="lines",
+                    name="Programadas", line=dict(color=COLORS.get("prog", "#EF4444"), width=1.6)
+                ))
                 st.plotly_chart(figb, use_container_width=True, key=f"tfn-real-tipo-{x0}-{x1}")
 
-        # ================= Error diario (sMAPE con ILS vs Real) =================
-        if "ops_teoricas_ILS Cat.1" in _df_f.columns:
-            smape_t = smape_series(y_real, y_ils)  # fracción [0..2]
-            fig_err = go.Figure()
-            fig_err.update_layout(
-                hovermode="x",
-                xaxis_title="Fecha",
-                yaxis_title="% error diario (sMAPE ILS vs Real)",
-                height=280
-            )
-            fig_err.add_trace(go.Scatter(x=_df_f["fecha_utc"], y=smape_t, mode="lines", name="sMAPE diario"))
-            fig_err.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig_err, use_container_width=True, key=f"err-smape-ils-{x0}-{x1}")
-
-        # ================= Factor de escala para predicción =================
-        st.subheader("Factor de escala para predicción (aplicar a ILS)")
-
-        if "ops_teoricas_ILS Cat.1" in _df_f.columns and s_ils > 0:
-            # k* global en el tramo
-            k_global = float(s_real / s_ils) if s_ils > 0 else float("nan")
-
-            # k_m por mes del año
-            _df_f["_mes"] = _df_f["fecha_utc"].dt.month
-            sum_real_m = y_real.groupby(_df_f["_mes"]).sum(min_count=1)
-            sum_ils_m  = y_ils.groupby(_df_f["_mes"]).sum(min_count=1)
-            k_month = (sum_real_m / sum_ils_m).replace([np.inf, -np.inf], np.nan)
-
-            esquema = st.radio(
-                "Esquema de escala",
-                options=[f"Global (k* = {k_global:.3f})", "Mensual (k_m por mes del año)"],
-                index=0,
-                help="Multiplicamos ILS por k para estimar Real:  Ŷ = k · ILS."
-            )
-
-            if esquema.startswith("Global"):
-                y_pred = y_ils * k_global
-                k_used = pd.Series(k_global, index=_df_f.index)
-            else:
-                # asigna k_m por mes; si falta mes, usa k_global como reserva
-                k_map = _df_f["_mes"].map(k_month)
-                k_map = k_map.fillna(k_global)
-                y_pred = y_ils * k_map
-                k_used = k_map
-
-            # Error del tramo con la predicción escalada
-            err_pred_wape = wape(y_real, y_pred)
-
-            # KPIs del factor
-            c1, c2, c3 = st.columns(3)
-            c1.metric("k* (global)", f"{k_global:.3f}")
-            c2.metric("Error % tramo usando k (WAPE)", f"{err_pred_wape:.1%}" if pd.notna(err_pred_wape) else "—")
-            c3.metric("Suma predicha (Ŷ)", f"{int(y_pred.fillna(0).sum()):,}".replace(",", "."))
-
-            # Gráfica Predicho vs Real
-            figp = go.Figure()
-            figp.update_layout(hovermode="x unified", xaxis_title="Fecha", yaxis_title="Operaciones", height=420)
-            figp.add_trace(go.Scatter(x=_df_f["fecha_utc"], y=y_real, mode="lines", name="Real"))
-            figp.add_trace(go.Scatter(x=_df_f["fecha_utc"], y=y_pred, mode="lines", name="Predicho (k·ILS)"))
-            figp.update_xaxes(rangeslider=dict(visible=True))
-            st.plotly_chart(figp, use_container_width=True, key=f"tfn-predicho-{x0}-{x1}")
-
-            # (Opcional) muestra k_m por mes si se eligió esquema mensual
-            if esquema.startswith("Mensual"):
-                km_tbl = pd.DataFrame({
-                    "Mes": [NUM_A_MES[m] if 'NUM_A_MES' in globals() and m in NUM_A_MES else m for m in k_month.index],
-                    "k_m": k_month.round(3)
-                })
-                st.dataframe(km_tbl, use_container_width=True, hide_index=True)
-
-            # Descarga ligera de la predicción del tramo
-            out = pd.DataFrame({
-                "Fecha": _df_f["fecha_utc"],
-                "Real": y_real,
-                "ILS": y_ils,
-                "k_aplicado": k_used,
-                "Predicho": y_pred
-            })
-            st.download_button(
-                "⬇️ Descargar predicción (tramo actual)",
-                data=out.to_csv(index=False).encode("utf-8"),
-                file_name=f"prediccion_k_{x0.date()}_{x1.date()}.csv",
-                mime="text/csv"
-            )
-        else:
-            st.info("No hay ILS teórica suficiente en el tramo para calcular el factor de escala (k*).")
-
-        # ================= Explicación =================
-        st.subheader("Qué significan los errores y cómo usar k* para predecir")
-        st.markdown("- **WAPE (tramo)**: mide el desajuste **total** del periodo.\n"
-                    "  ")
-        st.latex(r"\mathrm{WAPE}=\frac{\sum_t |\,\text{Real}_t-\text{ILS}_t\,|}{\sum_t \text{Real}_t}")
-        st.markdown("  *0 % es perfecto; >20–30 % suele indicar desajuste relevante.*")
-
-        st.markdown("- **sMAPE (diario)**: % de error **por día** (acotado 0–200 %) y no explota si Real=0.")
-        st.latex(r"\mathrm{sMAPE}_t=\frac{2\,|\,\text{Real}_t-\text{ILS}_t\,|}{|\,\text{Real}_t\,|+|\,\text{ILS}_t\,|}")
-
-        st.markdown("- **Factor de escala (k)**: ajusta ILS al histórico para **predecir** Real.")
-        st.latex(r"k^*=\frac{\sum_t \text{Real}_t}{\sum_t \text{ILS}_t}\qquad;\qquad \widehat{\text{Real}}_t=k\cdot \text{ILS}_t")
-        st.markdown("  - **Global**: un único \(k^*\) para todo el tramo (simple y estable).\n"
-                    "  - **Mensual**: \(k_m\) por mes del año (captura estacionalidad si existe).\n"
-                    "  - Evalúa la calidad de la predicción con **WAPE del tramo** y usa la **curva sMAPE** para localizar días problemáticos.")
-        
+           
 
